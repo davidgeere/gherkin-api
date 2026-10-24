@@ -768,9 +768,6 @@ async fn put_rules(
     auth: AuthUser,
     Json(body): Json<RulesBody>,
 ) -> Result<Json<FamilyRules>, ApiError> {
-    if role_of(&state.pool, auth.user_id).await? != "parent" {
-        return Err(forbidden());
-    }
     let user_id = subject_for(&state.pool, &auth, Some(body.user_id)).await?;
     let blocked: Vec<String> = body.blocked_domains.iter().filter_map(|d| normalize_domain(d)).collect();
     let allowed: Vec<String> = body.allowed_domains.iter().filter_map(|d| normalize_domain(d)).collect();
