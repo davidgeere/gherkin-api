@@ -1483,7 +1483,7 @@ async fn get_collection(
     .await
     .map_err(ApiError::db)?;
     let (location, motion, health, wifi, bluetooth, battery) =
-        row.unwrap_or((true, false, false, false, false, false));
+        row.unwrap_or((true, false, true, false, false, false));
     Ok(Json(CollectionOut {
         location,
         motion,
