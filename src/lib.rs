@@ -112,6 +112,17 @@ CREATE TABLE IF NOT EXISTS family_activity (
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS family_activity_child ON family_activity (child_user_id, recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS collection (
+    user_id UUID PRIMARY KEY REFERENCES users(id),
+    location BOOLEAN NOT NULL DEFAULT true,
+    motion BOOLEAN NOT NULL DEFAULT false,
+    health BOOLEAN NOT NULL DEFAULT false,
+    wifi BOOLEAN NOT NULL DEFAULT false,
+    bluetooth BOOLEAN NOT NULL DEFAULT false,
+    battery BOOLEAN NOT NULL DEFAULT false,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ALTER TABLE family_rules ADD COLUMN IF NOT EXISTS web_locked BOOLEAN NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -191,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/family/people", get(list_family))
         .route("/v1/family/rules", get(get_rules).put(put_rules))
         .route("/v1/family/activity", get(list_activity).post(post_activity))
+        .route("/v1/collection", get(get_collection).put(put_collection))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
 }
@@ -1447,6 +1459,86 @@ async fn delete_webhook(
         return Err(ApiError::not_found("webhook not found"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct CollectionOut {
+    location: bool,
+    motion: bool,
+    health: bool,
+    wifi: bool,
+    bluetooth: bool,
+    battery: bool,
+}
+
+async fn get_collection(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<CollectionOut>, ApiError> {
+    let row = sqlx::query_as::<_, (bool, bool, bool, bool, bool, bool)>(
+        "SELECT location, motion, health, wifi, bluetooth, battery FROM collection WHERE user_id = $1",
+    )
+    .bind(auth.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let (location, motion, health, wifi, bluetooth, battery) =
+        row.unwrap_or((true, false, false, false, false, false));
+    Ok(Json(CollectionOut {
+        location,
+        motion,
+        health,
+        wifi,
+        bluetooth,
+        battery,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CollectionBody {
+    location: bool,
+    motion: bool,
+    health: bool,
+    wifi: bool,
+    bluetooth: bool,
+    battery: bool,
+}
+
+async fn put_collection(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<CollectionBody>,
+) -> Result<Json<CollectionOut>, ApiError> {
+    sqlx::query(
+        r#"INSERT INTO collection (user_id, location, motion, health, wifi, bluetooth, battery, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+           ON CONFLICT (user_id) DO UPDATE SET
+             location = EXCLUDED.location,
+             motion = EXCLUDED.motion,
+             health = EXCLUDED.health,
+             wifi = EXCLUDED.wifi,
+             bluetooth = EXCLUDED.bluetooth,
+             battery = EXCLUDED.battery,
+             updated_at = now()"#,
+    )
+    .bind(auth.user_id)
+    .bind(body.location)
+    .bind(body.motion)
+    .bind(body.health)
+    .bind(body.wifi)
+    .bind(body.bluetooth)
+    .bind(body.battery)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(CollectionOut {
+        location: body.location,
+        motion: body.motion,
+        health: body.health,
+        wifi: body.wifi,
+        bluetooth: body.bluetooth,
+        battery: body.battery,
+    }))
 }
 
 #[derive(Deserialize)]
