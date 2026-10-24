@@ -1,0 +1,26 @@
+# Render Blueprint. The service URL is reachable so the phones can call it.
+# Every data route requires a bearer token. The database accepts no public connections.
+services:
+  - type: web
+    name: gherkin-api
+    runtime: rust
+    plan: starter
+    region: oregon
+    buildCommand: cargo build --release
+    startCommand: ./target/release/gherkin serve
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gherkin
+          property: connectionString
+      - key: GHERKIN_SETUP_TOKEN
+        generateValue: true
+
+databases:
+  - name: gherkin
+    databaseName: gherkin
+    user: gherkin
+    plan: basic-256mb
+    region: oregon
+    ipAllowList: []
