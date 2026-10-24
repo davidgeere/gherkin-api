@@ -90,6 +90,27 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS system_name TEXT NOT NULL DEFAULT '
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS system_version TEXT NOT NULL DEFAULT '';
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS vendor_id TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS devices_user_unique ON devices (user_id);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'parent';
+
+CREATE TABLE IF NOT EXISTS family_rules (
+    child_user_id UUID PRIMARY KEY REFERENCES users(id),
+    blocked_domains TEXT[] NOT NULL DEFAULT '{}',
+    allowed_domains TEXT[] NOT NULL DEFAULT '{}',
+    downtime_start SMALLINT,
+    downtime_end SMALLINT,
+    updated_by UUID REFERENCES users(id),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS family_activity (
+    id UUID PRIMARY KEY,
+    child_user_id UUID NOT NULL REFERENCES users(id),
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS family_activity_child ON family_activity (child_user_id, recorded_at DESC);
 "#;
 
 #[derive(Clone)]
@@ -141,6 +162,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/commands", post(create_command))
         .route("/v1/commands/pending", get(pending_commands))
         .route("/v1/commands/{id}/result", post(finish_command))
+        .route("/v1/family/children", get(list_children))
+        .route("/v1/family/rules", get(get_rules).put(put_rules))
+        .route("/v1/family/activity", get(list_activity).post(post_activity))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state)
 }
@@ -298,6 +322,7 @@ struct UserOut {
     id: Uuid,
     email: String,
     display_name: String,
+    role: String,
 }
 
 #[derive(FromRow)]
@@ -306,6 +331,7 @@ struct UserRow {
     email: String,
     display_name: String,
     password_hash: String,
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -317,12 +343,12 @@ struct NewUser {
 
 async fn seed_people(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"INSERT INTO users (id, email, display_name, password_hash) VALUES
-           ('11111111-1111-4111-8111-111111111111', 'david.gear@gherkin.local', 'David Gear', '!'),
-           ('22222222-2222-4222-8222-222222222222', 'stephanie.gear@gherkin.local', 'Stephanie Gear', '!'),
-           ('33333333-3333-4333-8333-333333333333', 'maya.gear@gherkin.local', 'Maya Gear', '!'),
-           ('44444444-4444-4444-8444-444444444444', 'test@gherkin.local', 'Test', '!')
-           ON CONFLICT (id) DO NOTHING"#,
+        r#"INSERT INTO users (id, email, display_name, password_hash, role) VALUES
+           ('11111111-1111-4111-8111-111111111111', 'david.gear@gherkin.local', 'David Gear', '!', 'parent'),
+           ('22222222-2222-4222-8222-222222222222', 'stephanie.gear@gherkin.local', 'Stephanie Gear', '!', 'parent'),
+           ('33333333-3333-4333-8333-333333333333', 'maya.gear@gherkin.local', 'Maya Gear', '!', 'child'),
+           ('44444444-4444-4444-8444-444444444444', 'test@gherkin.local', 'Test', '!', 'parent')
+           ON CONFLICT (id) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name"#,
     )
     .execute(pool)
     .await?;
@@ -374,7 +400,7 @@ async fn claim_person(
     Json(body): Json<ClaimBody>,
 ) -> Result<(StatusCode, Json<ClaimOut>), ApiError> {
     let user = sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, display_name, password_hash FROM users WHERE id = $1",
+        "SELECT id, email, display_name, password_hash, role FROM users WHERE id = $1",
     )
     .bind(body.user_id)
     .fetch_optional(&state.pool)
@@ -429,6 +455,7 @@ async fn claim_person(
                 id: user.id,
                 email: user.email,
                 display_name: user.display_name,
+                role: user.role,
             },
             device_id,
         }),
@@ -468,6 +495,7 @@ async fn create_user(
             id,
             email,
             display_name: body.display_name.trim().to_string(),
+            role: "parent".to_string(),
         }),
     ))
 }
@@ -490,7 +518,7 @@ async fn login(
 ) -> Result<(StatusCode, Json<LoginOut>), ApiError> {
     let email = normalize_email(&body.email);
     let row = sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, display_name, password_hash FROM users WHERE email = $1",
+        "SELECT id, email, display_name, password_hash, role FROM users WHERE email = $1",
     )
     .bind(&email)
     .fetch_optional(&state.pool)
@@ -526,6 +554,7 @@ async fn login(
                 id: user.id,
                 email: user.email.clone(),
                 display_name: user.display_name.clone(),
+                role: user.role.clone(),
             },
         }),
     ))
@@ -542,7 +571,7 @@ async fn me(
     auth: AuthUser,
 ) -> Result<Json<UserOut>, ApiError> {
     let row = sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, display_name, password_hash FROM users WHERE id = $1",
+        "SELECT id, email, display_name, password_hash, role FROM users WHERE id = $1",
     )
     .bind(auth.user_id)
     .fetch_one(&state.pool)
@@ -552,7 +581,250 @@ async fn me(
         id: row.id,
         email: row.email,
         display_name: row.display_name,
+        role: row.role,
     }))
+}
+
+fn forbidden() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, "not allowed")
+}
+
+async fn role_of(pool: &PgPool, user_id: Uuid) -> Result<String, ApiError> {
+    sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(ApiError::db)?
+        .ok_or_else(|| ApiError::not_found("person not found"))
+}
+
+async fn list_children(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<PersonOut>>, ApiError> {
+    if role_of(&state.pool, auth.user_id).await? != "parent" {
+        return Err(forbidden());
+    }
+    let rows = sqlx::query_as::<_, PersonOut>(
+        "SELECT id, display_name FROM users WHERE role = 'child' ORDER BY display_name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
+}
+
+#[derive(Serialize, FromRow)]
+struct FamilyRules {
+    child_id: Uuid,
+    blocked_domains: Vec<String>,
+    allowed_domains: Vec<String>,
+    downtime_start: Option<String>,
+    downtime_end: Option<String>,
+}
+
+fn format_hhmm(minutes: Option<i16>) -> Option<String> {
+    minutes.map(|mins| format!("{:02}:{:02}", mins / 60, mins % 60))
+}
+
+fn parse_hhmm(value: &str) -> Result<Option<i16>, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let Some((hour, minute)) = value.split_once(':') else {
+        return Err(ApiError::bad("time is HH:MM"));
+    };
+    let hour: i16 = hour.parse().map_err(|_| ApiError::bad("time is HH:MM"))?;
+    let minute: i16 = minute.parse().map_err(|_| ApiError::bad("time is HH:MM"))?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) {
+        return Err(ApiError::bad("time is HH:MM"));
+    }
+    Ok(Some(hour * 60 + minute))
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut host = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = host.strip_prefix("https://") {
+        host = rest.to_string();
+    }
+    if let Some(rest) = host.strip_prefix("http://") {
+        host = rest.to_string();
+    }
+    host = host.split(['/', '?', '#']).next().unwrap_or("").to_string();
+    host = host.trim_end_matches('.').to_string();
+    if host.is_empty() || host.len() > 253 || !host.contains('.') {
+        return None;
+    }
+    if host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        Some(host)
+    } else {
+        None
+    }
+}
+
+async fn child_for_reader(
+    pool: &PgPool,
+    auth: &AuthUser,
+    requested: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let role = role_of(pool, auth.user_id).await?;
+    if role == "child" {
+        if requested.is_some_and(|id| id != auth.user_id) {
+            return Err(forbidden());
+        }
+        return Ok(auth.user_id);
+    }
+    if role != "parent" {
+        return Err(forbidden());
+    }
+    let Some(child_id) = requested else {
+        return Err(ApiError::bad("child_id is required"));
+    };
+    let child_role = role_of(pool, child_id).await?;
+    if child_role != "child" {
+        return Err(ApiError::not_found("child not found"));
+    }
+    Ok(child_id)
+}
+
+#[derive(Deserialize)]
+struct RulesQuery {
+    child_id: Option<Uuid>,
+}
+
+async fn get_rules(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(query): Query<RulesQuery>,
+) -> Result<Json<FamilyRules>, ApiError> {
+    let child_id = child_for_reader(&state.pool, &auth, query.child_id).await?;
+    let row = sqlx::query_as::<_, (Vec<String>, Vec<String>, Option<i16>, Option<i16>)>(
+        "SELECT blocked_domains, allowed_domains, downtime_start, downtime_end FROM family_rules WHERE child_user_id = $1",
+    )
+    .bind(child_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let (blocked, allowed, start, end) = row.unwrap_or_default();
+    Ok(Json(FamilyRules {
+        child_id,
+        blocked_domains: blocked,
+        allowed_domains: allowed,
+        downtime_start: format_hhmm(start),
+        downtime_end: format_hhmm(end),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RulesBody {
+    child_id: Uuid,
+    blocked_domains: Vec<String>,
+    allowed_domains: Vec<String>,
+    downtime_start: Option<String>,
+    downtime_end: Option<String>,
+}
+
+async fn put_rules(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<RulesBody>,
+) -> Result<Json<FamilyRules>, ApiError> {
+    if role_of(&state.pool, auth.user_id).await? != "parent" {
+        return Err(forbidden());
+    }
+    let child_id = child_for_reader(&state.pool, &auth, Some(body.child_id)).await?;
+    let blocked: Vec<String> = body.blocked_domains.iter().filter_map(|d| normalize_domain(d)).collect();
+    let allowed: Vec<String> = body.allowed_domains.iter().filter_map(|d| normalize_domain(d)).collect();
+    let start = parse_hhmm(body.downtime_start.as_deref().unwrap_or(""))?;
+    let end = parse_hhmm(body.downtime_end.as_deref().unwrap_or(""))?;
+    if start.is_some() != end.is_some() {
+        return Err(ApiError::bad("downtime needs a start and an end"));
+    }
+    sqlx::query(
+        r#"INSERT INTO family_rules (child_user_id, blocked_domains, allowed_domains, downtime_start, downtime_end, updated_by, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, now())
+           ON CONFLICT (child_user_id) DO UPDATE SET
+             blocked_domains = EXCLUDED.blocked_domains,
+             allowed_domains = EXCLUDED.allowed_domains,
+             downtime_start = EXCLUDED.downtime_start,
+             downtime_end = EXCLUDED.downtime_end,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = now()"#,
+    )
+    .bind(child_id)
+    .bind(&blocked)
+    .bind(&allowed)
+    .bind(start)
+    .bind(end)
+    .bind(auth.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(FamilyRules {
+        child_id,
+        blocked_domains: blocked,
+        allowed_domains: allowed,
+        downtime_start: format_hhmm(start),
+        downtime_end: format_hhmm(end),
+    }))
+}
+
+#[derive(Serialize, FromRow)]
+struct ActivityOut {
+    id: Uuid,
+    kind: String,
+    detail: String,
+    recorded_at: DateTime<Utc>,
+}
+
+async fn list_activity(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(query): Query<RulesQuery>,
+) -> Result<Json<Vec<ActivityOut>>, ApiError> {
+    let child_id = child_for_reader(&state.pool, &auth, query.child_id).await?;
+    let rows = sqlx::query_as::<_, ActivityOut>(
+        "SELECT id, kind, detail, recorded_at FROM family_activity WHERE child_user_id = $1 ORDER BY recorded_at DESC LIMIT 50",
+    )
+    .bind(child_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct ActivityBody {
+    kind: String,
+    detail: String,
+}
+
+async fn post_activity(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<ActivityBody>,
+) -> Result<StatusCode, ApiError> {
+    if role_of(&state.pool, auth.user_id).await? != "child" {
+        return Err(forbidden());
+    }
+    if !valid_kind(&body.kind) || body.detail.trim().is_empty() || body.detail.len() > 500 {
+        return Err(ApiError::bad("kind and detail are required"));
+    }
+    sqlx::query(
+        "INSERT INTO family_activity (id, child_user_id, kind, detail) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(auth.user_id)
+    .bind(&body.kind)
+    .bind(body.detail.trim())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(StatusCode::CREATED)
 }
 
 #[derive(Deserialize)]
