@@ -113,6 +113,21 @@ CREATE TABLE IF NOT EXISTS family_activity (
 );
 CREATE INDEX IF NOT EXISTS family_activity_child ON family_activity (child_user_id, recorded_at DESC);
 ALTER TABLE family_rules ADD COLUMN IF NOT EXISTS web_locked BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS admins (
+    id UUID PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    id UUID PRIMARY KEY,
+    admin_id UUID NOT NULL REFERENCES admins(id),
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ
+);
 "#;
 
 #[derive(Clone)]
@@ -132,6 +147,11 @@ impl AppState {
             .await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         seed_people(&pool).await?;
+        if let Ok(password) = std::env::var("GHERKIN_ADMIN_PASSWORD") {
+            if !password.is_empty() {
+                let _ = seed_admin(&pool, &password).await;
+            }
+        }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
@@ -157,7 +177,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/me", get(me))
         .route("/v1/tokens", post(create_token))
         .route("/v1/tokens/{id}", axum::routing::delete(revoke_token))
-        .route("/v1/devices", post(create_device))
+        .route("/v1/devices", post(create_device).get(list_devices))
+        .route("/v1/admin/login", post(admin_login))
+        .route("/v1/admin/people", get(admin_people))
+        .route("/v1/admin/tokens", get(admin_list_tokens).post(admin_create_token))
+        .route("/v1/admin/tokens/{id}", axum::routing::delete(admin_revoke_token))
         .route("/v1/events", post(create_event).get(list_events))
         .route("/v1/webhooks", post(create_webhook).get(list_webhooks))
         .route("/v1/webhooks/{id}", axum::routing::delete(delete_webhook))
@@ -346,11 +370,11 @@ struct NewUser {
 async fn seed_people(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"INSERT INTO users (id, email, display_name, password_hash, role) VALUES
-           ('11111111-1111-4111-8111-111111111111', 'david.gear@gherkin.local', 'David Gear', '!', 'parent'),
-           ('22222222-2222-4222-8222-222222222222', 'stephanie.gear@gherkin.local', 'Stephanie Gear', '!', 'parent'),
-           ('33333333-3333-4333-8333-333333333333', 'maya.gear@gherkin.local', 'Maya Gear', '!', 'child'),
+           ('11111111-1111-4111-8111-111111111111', 'david.geere@gherkin.local', 'David Geere', '!', 'parent'),
+           ('22222222-2222-4222-8222-222222222222', 'stephanie.geere@gherkin.local', 'Stephanie Geere', '!', 'parent'),
+           ('33333333-3333-4333-8333-333333333333', 'maya.geere@gherkin.local', 'Maya Geere', '!', 'child'),
            ('44444444-4444-4444-8444-444444444444', 'test@gherkin.local', 'Test', '!', 'parent')
-           ON CONFLICT (id) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name"#,
+           ON CONFLICT (id) DO UPDATE SET role = EXCLUDED.role, display_name = EXCLUDED.display_name, email = EXCLUDED.email"#,
     )
     .execute(pool)
     .await?;
@@ -839,6 +863,204 @@ struct TokenOut {
     kind: &'static str,
 }
 
+const ADMIN_EMAIL: &str = "david@geere.org";
+
+async fn seed_admin(pool: &PgPool, password: &str) -> Result<(), ApiError> {
+    let hash = hash_password(password)?;
+    sqlx::query(
+        r#"INSERT INTO admins (id, email, password_hash) VALUES ($1, $2, $3)
+           ON CONFLICT (email) DO UPDATE SET password_hash = EXCLUDED.password_hash"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(ADMIN_EMAIL)
+    .bind(&hash)
+    .execute(pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(())
+}
+
+struct AdminAuth {
+    #[allow(dead_code)]
+    admin_id: Uuid,
+}
+
+impl FromRequestParts<AppState> for AdminAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer(&parts.headers).ok_or_else(ApiError::unauthorized)?;
+        let hash = hash_token(&token);
+        let admin_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT admin_id FROM admin_sessions WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(&hash)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+        let Some(admin_id) = admin_id else {
+            return Err(ApiError::unauthorized());
+        };
+        Ok(AdminAuth { admin_id })
+    }
+}
+
+#[derive(Deserialize)]
+struct AdminLogin {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AdminLoginOut {
+    token: String,
+}
+
+async fn admin_login(
+    State(state): State<AppState>,
+    Json(body): Json<AdminLogin>,
+) -> Result<(StatusCode, Json<AdminLoginOut>), ApiError> {
+    if normalize_email(&body.email) != ADMIN_EMAIL {
+        let _ = verify_password(&body.password, &state.dummy_password_hash);
+        return Err(ApiError::unauthorized());
+    }
+    let row = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, password_hash FROM admins WHERE email = $1",
+    )
+    .bind(ADMIN_EMAIL)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let Some((admin_id, hash)) = row else {
+        let _ = verify_password(&body.password, &state.dummy_password_hash);
+        return Err(ApiError::unauthorized());
+    };
+    if !verify_password(&body.password, &hash) {
+        return Err(ApiError::unauthorized());
+    }
+    let (token, token_hash) = new_secret("gha");
+    sqlx::query(
+        "INSERT INTO admin_sessions (id, admin_id, token_hash) VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(admin_id)
+    .bind(&token_hash)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok((StatusCode::CREATED, Json(AdminLoginOut { token })))
+}
+
+#[derive(Serialize, FromRow)]
+struct AdminPerson {
+    id: Uuid,
+    display_name: String,
+    role: String,
+}
+
+async fn admin_people(
+    State(state): State<AppState>,
+    _: AdminAuth,
+) -> Result<Json<Vec<AdminPerson>>, ApiError> {
+    let rows = sqlx::query_as::<_, AdminPerson>(
+        "SELECT id, display_name, role FROM users ORDER BY display_name",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct AdminTokenQuery {
+    user_id: Uuid,
+}
+
+#[derive(Serialize, FromRow)]
+struct AgentKey {
+    id: Uuid,
+    name: String,
+    kind: String,
+    created_at: DateTime<Utc>,
+    revoked: bool,
+}
+
+async fn admin_list_tokens(
+    State(state): State<AppState>,
+    _: AdminAuth,
+    Query(query): Query<AdminTokenQuery>,
+) -> Result<Json<Vec<AgentKey>>, ApiError> {
+    let _ = role_of(&state.pool, query.user_id).await?;
+    let rows = sqlx::query_as::<_, AgentKey>(
+        r#"SELECT id, name, kind, created_at, revoked_at IS NOT NULL AS revoked
+           FROM tokens WHERE user_id = $1 ORDER BY created_at DESC"#,
+    )
+    .bind(query.user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+struct AdminNewToken {
+    user_id: Uuid,
+    name: String,
+}
+
+async fn admin_create_token(
+    State(state): State<AppState>,
+    _: AdminAuth,
+    Json(body): Json<AdminNewToken>,
+) -> Result<(StatusCode, Json<TokenOut>), ApiError> {
+    let _ = role_of(&state.pool, body.user_id).await?;
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err(ApiError::bad("name is required"));
+    }
+    let (token, hash) = new_secret("ghk");
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tokens (id, user_id, name, token_hash, kind) VALUES ($1, $2, $3, $4, 'agent')",
+    )
+    .bind(id)
+    .bind(body.user_id)
+    .bind(name)
+    .bind(&hash)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(TokenOut {
+            id,
+            token,
+            kind: "agent",
+        }),
+    ))
+}
+
+async fn admin_revoke_token(
+    State(state): State<AppState>,
+    _: AdminAuth,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let result = sqlx::query(
+        "UPDATE tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("token not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_token(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -901,6 +1123,20 @@ struct DeviceOut {
     id: Uuid,
     name: String,
     platform: String,
+}
+
+async fn list_devices(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<DeviceOut>>, ApiError> {
+    let rows = sqlx::query_as::<_, DeviceOut>(
+        "SELECT id, name, platform FROM devices WHERE user_id = $1 ORDER BY created_at",
+    )
+    .bind(auth.user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
 }
 
 async fn create_device(
