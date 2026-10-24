@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS family_rules (
     allowed_domains TEXT[] NOT NULL DEFAULT '{}',
     downtime_start SMALLINT,
     downtime_end SMALLINT,
+    web_locked BOOLEAN NOT NULL DEFAULT false,
     updated_by UUID REFERENCES users(id),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -111,6 +112,7 @@ CREATE TABLE IF NOT EXISTS family_activity (
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS family_activity_child ON family_activity (child_user_id, recorded_at DESC);
+ALTER TABLE family_rules ADD COLUMN IF NOT EXISTS web_locked BOOLEAN NOT NULL DEFAULT false;
 "#;
 
 #[derive(Clone)]
@@ -162,7 +164,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/commands", post(create_command))
         .route("/v1/commands/pending", get(pending_commands))
         .route("/v1/commands/{id}/result", post(finish_command))
-        .route("/v1/family/children", get(list_children))
+        .route("/v1/family/people", get(list_family))
         .route("/v1/family/rules", get(get_rules).put(put_rules))
         .route("/v1/family/activity", get(list_activity).post(post_activity))
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
@@ -598,7 +600,7 @@ async fn role_of(pool: &PgPool, user_id: Uuid) -> Result<String, ApiError> {
         .ok_or_else(|| ApiError::not_found("person not found"))
 }
 
-async fn list_children(
+async fn list_family(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<Vec<PersonOut>>, ApiError> {
@@ -606,7 +608,7 @@ async fn list_children(
         return Err(forbidden());
     }
     let rows = sqlx::query_as::<_, PersonOut>(
-        "SELECT id, display_name FROM users WHERE role = 'child' ORDER BY display_name",
+        "SELECT id, display_name FROM users ORDER BY display_name",
     )
     .fetch_all(&state.pool)
     .await
@@ -616,11 +618,12 @@ async fn list_children(
 
 #[derive(Serialize, FromRow)]
 struct FamilyRules {
-    child_id: Uuid,
+    user_id: Uuid,
     blocked_domains: Vec<String>,
     allowed_domains: Vec<String>,
     downtime_start: Option<String>,
     downtime_end: Option<String>,
+    web_locked: bool,
 }
 
 fn format_hhmm(minutes: Option<i16>) -> Option<String> {
@@ -666,34 +669,28 @@ fn normalize_domain(raw: &str) -> Option<String> {
     }
 }
 
-async fn child_for_reader(
+async fn subject_for(
     pool: &PgPool,
     auth: &AuthUser,
     requested: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
     let role = role_of(pool, auth.user_id).await?;
-    if role == "child" {
+    if role != "parent" {
         if requested.is_some_and(|id| id != auth.user_id) {
             return Err(forbidden());
         }
         return Ok(auth.user_id);
     }
-    if role != "parent" {
-        return Err(forbidden());
-    }
-    let Some(child_id) = requested else {
-        return Err(ApiError::bad("child_id is required"));
+    let Some(user_id) = requested else {
+        return Ok(auth.user_id);
     };
-    let child_role = role_of(pool, child_id).await?;
-    if child_role != "child" {
-        return Err(ApiError::not_found("child not found"));
-    }
-    Ok(child_id)
+    let _ = role_of(pool, user_id).await?;
+    Ok(user_id)
 }
 
 #[derive(Deserialize)]
 struct RulesQuery {
-    child_id: Option<Uuid>,
+    user_id: Option<Uuid>,
 }
 
 async fn get_rules(
@@ -701,31 +698,33 @@ async fn get_rules(
     auth: AuthUser,
     Query(query): Query<RulesQuery>,
 ) -> Result<Json<FamilyRules>, ApiError> {
-    let child_id = child_for_reader(&state.pool, &auth, query.child_id).await?;
-    let row = sqlx::query_as::<_, (Vec<String>, Vec<String>, Option<i16>, Option<i16>)>(
-        "SELECT blocked_domains, allowed_domains, downtime_start, downtime_end FROM family_rules WHERE child_user_id = $1",
+    let user_id = subject_for(&state.pool, &auth, query.user_id).await?;
+    let row = sqlx::query_as::<_, (Vec<String>, Vec<String>, Option<i16>, Option<i16>, bool)>(
+        "SELECT blocked_domains, allowed_domains, downtime_start, downtime_end, web_locked FROM family_rules WHERE child_user_id = $1",
     )
-    .bind(child_id)
+    .bind(user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::db)?;
-    let (blocked, allowed, start, end) = row.unwrap_or_default();
+    let (blocked, allowed, start, end, locked) = row.unwrap_or_default();
     Ok(Json(FamilyRules {
-        child_id,
+        user_id,
         blocked_domains: blocked,
         allowed_domains: allowed,
         downtime_start: format_hhmm(start),
         downtime_end: format_hhmm(end),
+        web_locked: locked,
     }))
 }
 
 #[derive(Deserialize)]
 struct RulesBody {
-    child_id: Uuid,
+    user_id: Uuid,
     blocked_domains: Vec<String>,
     allowed_domains: Vec<String>,
     downtime_start: Option<String>,
     downtime_end: Option<String>,
+    web_locked: Option<bool>,
 }
 
 async fn put_rules(
@@ -736,7 +735,7 @@ async fn put_rules(
     if role_of(&state.pool, auth.user_id).await? != "parent" {
         return Err(forbidden());
     }
-    let child_id = child_for_reader(&state.pool, &auth, Some(body.child_id)).await?;
+    let user_id = subject_for(&state.pool, &auth, Some(body.user_id)).await?;
     let blocked: Vec<String> = body.blocked_domains.iter().filter_map(|d| normalize_domain(d)).collect();
     let allowed: Vec<String> = body.allowed_domains.iter().filter_map(|d| normalize_domain(d)).collect();
     let start = parse_hhmm(body.downtime_start.as_deref().unwrap_or(""))?;
@@ -744,32 +743,36 @@ async fn put_rules(
     if start.is_some() != end.is_some() {
         return Err(ApiError::bad("downtime needs a start and an end"));
     }
+    let locked = body.web_locked.unwrap_or(false);
     sqlx::query(
-        r#"INSERT INTO family_rules (child_user_id, blocked_domains, allowed_domains, downtime_start, downtime_end, updated_by, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, now())
+        r#"INSERT INTO family_rules (child_user_id, blocked_domains, allowed_domains, downtime_start, downtime_end, web_locked, updated_by, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, now())
            ON CONFLICT (child_user_id) DO UPDATE SET
              blocked_domains = EXCLUDED.blocked_domains,
              allowed_domains = EXCLUDED.allowed_domains,
              downtime_start = EXCLUDED.downtime_start,
              downtime_end = EXCLUDED.downtime_end,
+             web_locked = EXCLUDED.web_locked,
              updated_by = EXCLUDED.updated_by,
              updated_at = now()"#,
     )
-    .bind(child_id)
+    .bind(user_id)
     .bind(&blocked)
     .bind(&allowed)
     .bind(start)
     .bind(end)
+    .bind(locked)
     .bind(auth.user_id)
     .execute(&state.pool)
     .await
     .map_err(ApiError::db)?;
     Ok(Json(FamilyRules {
-        child_id,
+        user_id,
         blocked_domains: blocked,
         allowed_domains: allowed,
         downtime_start: format_hhmm(start),
         downtime_end: format_hhmm(end),
+        web_locked: locked,
     }))
 }
 
@@ -786,11 +789,11 @@ async fn list_activity(
     auth: AuthUser,
     Query(query): Query<RulesQuery>,
 ) -> Result<Json<Vec<ActivityOut>>, ApiError> {
-    let child_id = child_for_reader(&state.pool, &auth, query.child_id).await?;
+    let user_id = subject_for(&state.pool, &auth, query.user_id).await?;
     let rows = sqlx::query_as::<_, ActivityOut>(
         "SELECT id, kind, detail, recorded_at FROM family_activity WHERE child_user_id = $1 ORDER BY recorded_at DESC LIMIT 50",
     )
-    .bind(child_id)
+    .bind(user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::db)?;
@@ -808,9 +811,6 @@ async fn post_activity(
     auth: AuthUser,
     Json(body): Json<ActivityBody>,
 ) -> Result<StatusCode, ApiError> {
-    if role_of(&state.pool, auth.user_id).await? != "child" {
-        return Err(forbidden());
-    }
     if !valid_kind(&body.kind) || body.detail.trim().is_empty() || body.detail.len() > 500 {
         return Err(ApiError::bad("kind and detail are required"));
     }
