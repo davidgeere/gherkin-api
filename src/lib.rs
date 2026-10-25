@@ -85,6 +85,12 @@ CREATE TABLE IF NOT EXISTS commands (
 );
 CREATE INDEX IF NOT EXISTS commands_user_status ON commands (user_id, status, created_at);
 
+CREATE TABLE IF NOT EXISTS capabilities (
+    user_id UUID PRIMARY KEY REFERENCES users(id),
+    state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS model TEXT NOT NULL DEFAULT '';
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS system_name TEXT NOT NULL DEFAULT '';
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS system_version TEXT NOT NULL DEFAULT '';
@@ -196,9 +202,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/events", post(create_event).get(list_events))
         .route("/v1/webhooks", post(create_webhook).get(list_webhooks))
         .route("/v1/webhooks/{id}", axum::routing::delete(delete_webhook))
-        .route("/v1/commands", post(create_command))
+        .route("/v1/commands", post(create_command).get(list_commands))
         .route("/v1/commands/pending", get(pending_commands))
         .route("/v1/commands/{id}/result", post(finish_command))
+        .route("/v1/capabilities", get(get_capabilities).put(put_capabilities))
         .route("/v1/family/people", get(list_family))
         .route("/v1/family/rules", get(get_rules).put(put_rules))
         .route("/v1/family/activity", get(list_activity).post(post_activity))
@@ -1555,6 +1562,152 @@ struct CommandOut {
     status: String,
 }
 
+const CAPABILITY_KEYS: &[&str] = &[
+    "location",
+    "microphone",
+    "camera",
+    "screen",
+    "motion",
+    "health",
+    "notifications",
+    "bluetooth",
+    "screen_time",
+];
+
+fn capability_label(key: &str) -> &str {
+    match key {
+        "location" => "Location",
+        "microphone" => "Microphone",
+        "camera" => "Camera",
+        "screen" => "Screen recording",
+        "motion" => "Motion",
+        "health" => "Health",
+        "notifications" => "Notifications",
+        "bluetooth" => "Bluetooth",
+        "screen_time" => "Screen Time",
+        _ => key,
+    }
+}
+
+fn capability_key(kind: &str) -> Option<&'static str> {
+    match kind {
+        "location.now" => Some("location"),
+        "microphone.listen" => Some("microphone"),
+        "camera.capture" => Some("camera"),
+        "screen.capture" => Some("screen"),
+        "motion.snapshot" => Some("motion"),
+        "health.snapshot" => Some("health"),
+        "notify" => Some("notifications"),
+        "bluetooth.state" => Some("bluetooth"),
+        "screen.sites" | "screen.apps" => Some("screen_time"),
+        _ => None,
+    }
+}
+
+fn normalize_capabilities(state: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for key in CAPABILITY_KEYS {
+        let entry = state.get(*key);
+        let raw = entry
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("not_asked");
+        let status = if matches!(raw, "granted" | "denied" | "not_asked") {
+            raw
+        } else {
+            "not_asked"
+        };
+        let enabled = status == "granted"
+            && entry
+                .and_then(|value| value.get("enabled"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+        out.insert((*key).to_string(), json!({ "status": status, "enabled": enabled }));
+    }
+    Value::Object(out)
+}
+
+fn capability_block(state: &Value, kind: &str) -> Option<String> {
+    let key = capability_key(kind)?;
+    let label = capability_label(key);
+    let entry = state.get(key)?;
+    match entry.get("status").and_then(|value| value.as_str()).unwrap_or("not_asked") {
+        "granted" => {
+            if entry.get("enabled").and_then(|value| value.as_bool()).unwrap_or(false) {
+                None
+            } else {
+                Some(format!("{label} is turned off on the phone"))
+            }
+        }
+        "denied" => Some(format!("{label} was denied on the phone")),
+        _ => Some(format!("{label} has not been requested on the phone")),
+    }
+}
+
+async fn load_capabilities(pool: &PgPool, user_id: Uuid) -> Result<Value, ApiError> {
+    let stored: Option<Value> = sqlx::query_scalar("SELECT state FROM capabilities WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(ApiError::db)?;
+    Ok(normalize_capabilities(&stored.unwrap_or_else(|| json!({}))))
+}
+
+async fn get_capabilities(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(load_capabilities(&state.pool, auth.user_id).await?))
+}
+
+async fn put_capabilities(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let state_json = normalize_capabilities(&body);
+    sqlx::query(
+        r#"INSERT INTO capabilities (user_id, state)
+           VALUES ($1, $2)
+           ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now()"#,
+    )
+    .bind(auth.user_id)
+    .bind(&state_json)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(state_json))
+}
+
+#[derive(Serialize, FromRow)]
+struct CommandListItem {
+    id: Uuid,
+    kind: String,
+    status: String,
+    result: Value,
+    created_at: DateTime<Utc>,
+}
+
+async fn list_commands(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<CommandListItem>>, ApiError> {
+    let rows = sqlx::query_as::<_, CommandListItem>(
+        r#"SELECT id, kind, status,
+                  COALESCE(result, '{}'::jsonb) - 'imageBase64' - 'audioBase64' AS result,
+                  created_at
+           FROM commands
+           WHERE user_id = $1
+           ORDER BY created_at DESC
+           LIMIT 40"#,
+    )
+    .bind(auth.user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    Ok(Json(rows))
+}
+
 async fn create_command(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -1562,6 +1715,10 @@ async fn create_command(
 ) -> Result<(StatusCode, Json<CommandOut>), ApiError> {
     if !valid_kind(&body.kind) {
         return Err(ApiError::bad("invalid kind"));
+    }
+    let capabilities = load_capabilities(&state.pool, auth.user_id).await?;
+    if let Some(message) = capability_block(&capabilities, &body.kind) {
+        return Err(ApiError::conflict(message));
     }
     if let Some(device_id) = body.device_id {
         device_owned(&state, auth.user_id, device_id).await?;
@@ -1680,14 +1837,19 @@ async fn finish_command(
     Path(id): Path<Uuid>,
     Json(body): Json<CommandResult>,
 ) -> Result<StatusCode, ApiError> {
-    if body.status != "done" && body.status != "failed" {
-        return Err(ApiError::bad("status must be done or failed"));
+    if !matches!(body.status.as_str(), "running" | "done" | "failed" | "timed_out") {
+        return Err(ApiError::bad("status must be running, done, failed, or timed_out"));
     }
-    let result = sqlx::query(
+    let from = if body.status == "running" {
+        "'delivered'"
+    } else {
+        "'delivered', 'running'"
+    };
+    let result = sqlx::query(&format!(
         r#"UPDATE commands
            SET status = $3, result = $4, updated_at = now()
-           WHERE id = $1 AND user_id = $2 AND status = 'delivered'"#,
-    )
+           WHERE id = $1 AND user_id = $2 AND status IN ({from})"#
+    ))
     .bind(id)
     .bind(auth.user_id)
     .bind(&body.status)
