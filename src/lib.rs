@@ -408,9 +408,7 @@ struct PersonOut {
 
 async fn list_people(State(state): State<AppState>) -> Result<Json<Vec<PersonOut>>, ApiError> {
     let rows = sqlx::query_as::<_, PersonOut>(
-        r#"SELECT id, display_name FROM users u
-           WHERE NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id)
-           ORDER BY display_name"#,
+        "SELECT id, display_name FROM users ORDER BY display_name",
     )
     .fetch_all(&state.pool)
     .await
@@ -454,31 +452,38 @@ async fn claim_person(
     let Some(user) = user else {
         return Err(ApiError::not_found("person not found"));
     };
-    let taken = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices WHERE user_id = $1")
-        .bind(user.id)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(ApiError::db)?;
-    if taken > 0 {
-        return Err(ApiError::conflict("that person is already on a device"));
-    }
-    let device_id = Uuid::new_v4();
     let name = if body.device.name.trim().is_empty() {
         "iPhone"
     } else {
         body.device.name.trim()
     };
-    sqlx::query(
+    let device_id = sqlx::query_scalar::<_, Uuid>(
         r#"INSERT INTO devices (id, user_id, name, platform, model, system_name, system_version, vendor_id, last_seen_at)
-           VALUES ($1, $2, $3, 'ios', $4, $5, $6, $7, now())"#,
+           VALUES ($1, $2, $3, 'ios', $4, $5, $6, $7, now())
+           ON CONFLICT (user_id) DO UPDATE SET
+             name = EXCLUDED.name,
+             platform = 'ios',
+             model = EXCLUDED.model,
+             system_name = EXCLUDED.system_name,
+             system_version = EXCLUDED.system_version,
+             vendor_id = EXCLUDED.vendor_id,
+             last_seen_at = now()
+           RETURNING id"#,
     )
-    .bind(device_id)
+    .bind(Uuid::new_v4())
     .bind(user.id)
     .bind(name)
     .bind(body.device.model.trim())
     .bind(body.device.system_name.trim())
     .bind(body.device.system_version.trim())
     .bind(body.device.vendor_id.trim())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    sqlx::query(
+        "UPDATE tokens SET revoked_at = now() WHERE user_id = $1 AND name = 'passkey' AND revoked_at IS NULL",
+    )
+    .bind(user.id)
     .execute(&state.pool)
     .await
     .map_err(ApiError::db)?;
