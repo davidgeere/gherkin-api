@@ -1604,7 +1604,6 @@ fn capability_key(kind: &str) -> Option<&'static str> {
         "health.snapshot" => Some("health"),
         "notify" => Some("notifications"),
         "bluetooth.state" => Some("bluetooth"),
-        "screen.sites" | "screen.apps" => Some("screen_time"),
         _ => None,
     }
 }
